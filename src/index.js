@@ -62,10 +62,18 @@ export default {
 					console.log("❌ Errore fetch lead:", err);
 				}
 
-				const name = lead?.field_data?.find(f => f.name === "full_name")?.values?.[0] ?? "";
-				const phone = lead?.field_data?.find(f => f.name === "phone_number")?.values?.[0] ?? "";
+				// NOME: priorità a "nome_e_cognome"
+				const name =
+					lead?.field_data?.find(f => f.name === "nome_e_cognome")?.values?.[0] ??
+					lead?.field_data?.find(f => f.name === "full_name")?.values?.[0] ??
+					"";
 
-				console.log("👤 Estratto:", { name, phone });
+				// TELEFONO: priorità a "numero_di_telefono"
+				const phone =
+					lead?.field_data?.find(f => f.name === "numero_di_telefono")?.values?.[0] ??
+					lead?.field_data?.find(f => f.name === "phone_number")?.values?.[0] ??
+					"";
+				console.log(`👤 Estratto: name=${name}, phone=${phone}`);
 
 				/**************** 2b) Invio WhatsApp ****************/
 				if (phone) {
