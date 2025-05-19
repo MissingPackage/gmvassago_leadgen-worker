@@ -1,6 +1,6 @@
 /**********************************************************************
  * Cloudflare Worker – Lead capture + WhatsApp relay bidirezionale
- * versione DELAY 2025-06-17
+ * versione DELAY + NOTIFICA TEMPLATE 2025-06-17
  **********************************************************************/
 
 export default {
@@ -12,7 +12,7 @@ export default {
 		const { method, url } = request;
 		const u = new URL(url);
 
-		/* --- 1) HANDSHAKE ------------------------------------------- */
+		// --- 1) HANDSHAKE -------------------------------------------
 		if (method === 'GET' && u.pathname === '/webhook') {
 			const mode = u.searchParams.get('hub.mode');
 			const verifyTok = u.searchParams.get('hub.verify_token');
@@ -28,7 +28,7 @@ export default {
 			return new Response('Forbidden', { status: 403 });
 		}
 
-		/* --- 2) POST webhook ---------------------------------------- */
+		// --- 2) POST webhook ----------------------------------------
 		if (method === 'POST' && u.pathname === '/webhook') {
 			let body;
 			try { body = await request.json(); }
@@ -42,14 +42,14 @@ export default {
 				const change = body?.entry?.[0]?.changes?.[0];
 				if (!change) { console.warn('⚠️ Nessun change'); return ok(); }
 
-				/* -- leadgen -------------------------------------------- */
+				// -- leadgen --------------------------------------------
 				const leadId = change.value?.leadgen_id;
 				if (leadId) {
 					await handleLeadDelayed(leadId, env);
 					return ok();
 				}
 
-				/* -- messaggi / status ---------------------------------- */
+				// -- messaggi / status ----------------------------------
 				const msg = change.value?.messages?.[0];
 				const status = change.value?.statuses?.[0];        // non gestito ora
 				if (msg) await handleMessage(msg, env);
@@ -78,7 +78,12 @@ export default {
 
 			if (now - data.created >= data.delay) {
 				console.log(`🚀 INVIO ritardato a ${data.phone} (${data.name})`);
-				await sendTemplate(env, data.phone, env.TEMPLATE_LEAD, []);
+				const leadInfo = {
+					name: data.name,
+					phone: data.phone,
+					email: data.email || ""
+				};
+				await sendTemplate(env, data.phone, env.TEMPLATE_LEAD, [], leadInfo);
 				await env.KV.delete(k.name);
 			}
 		}
@@ -101,22 +106,28 @@ async function handleLeadDelayed(leadId, env) {
 	const name =
 		lead?.field_data?.find(x => x.name === 'nome_e_cognome')?.values?.[0] ??
 		lead?.field_data?.find(x => x.name === 'full_name')?.values?.[0] ?? '';
+	const email =
+		lead?.field_data?.find(f => f.name === 'email')?.values?.[0] ??
+		lead?.field_data?.find(f => f.name === 'e-mail')?.values?.[0] ?? '';
 
 	const phone = normalizePhone(rawPhone);
-	console.log('👤 Lead estratto:', { name, phone });
+
+	// LOG FORMATTATO
+	console.log(`👤 Lead estratto: Nome = "${name || '-'}" | Telefono = "${phone || '-'}" | Email = "${email || '-'}"`);
 
 	if (!phone) { console.warn('⚠️ Lead senza telefono'); return; }
 
 	/*-- delay 30-90 min --*/
 	const delayMs = 30 * 60 * 1000 + Math.floor(Math.random() * 60 * 60 * 1000);
 	await env.KV.put(`pending_lead:${phone}`, JSON.stringify({
-		phone, name,
+		phone, name, email,
 		created: Date.now(),
 		delay: delayMs
 	}), { expirationTtl: 2_592_000 });
 
-	/* salva anche nome per uso futuro (notify) */
+	// Salva anche nome e email per lookup (notifiche future)
 	await env.KV.put(`name:${phone}`, name, { expirationTtl: 2_592_000 });
+	await env.KV.put(`email:${phone}`, email, { expirationTtl: 2_592_000 });
 
 	console.log(`🕒 Lead in pending (${Math.round(delayMs / 60000)} min)`);
 }
@@ -139,9 +150,10 @@ async function handleMessage(msg, env) {
 	/* -- A) inbound utente -> Paolo ------------------------------ */
 	if (USER !== OWNER) {
 		const savedName = await env.KV.get(`name:${USER}`);
+		const savedEmail = await env.KV.get(`email:${USER}`);
 		const displayName = msg.profile?.name || savedName || USER;
 
-		console.log(`➡️ Nuovo msg da ${displayName} (${USER})`);
+		console.log(`➡️ Nuovo msg da ${displayName} (${USER}) - Email: ${savedEmail || "-"}`);
 
 		const tplId = await sendTemplate(env, env.OWNER_PHONE, env.TEMPLATE_NOTIFY, [
 			{ type: 'text', text: displayName },
@@ -177,7 +189,7 @@ async function handleMessage(msg, env) {
 /* ===================================================================
  * 3. SEND TEMPLATE / TEXT
  * =================================================================*/
-async function sendTemplate(env, to, name, parameters) {
+async function sendTemplate(env, to, name, parameters, leadInfo = null) {
 	const url = `https://graph.facebook.com/v22.0/${env.WHATSAPP_PHONE_ID}/messages`;
 
 	let components = [];
@@ -211,6 +223,22 @@ async function sendTemplate(env, to, name, parameters) {
 		body: JSON.stringify(body)
 	}).then(r => r.json());
 	console.log('📬 template resp:', JSON.stringify(j));
+
+	// Se errore invio lead, notifica Paolo (OWNER) tramite template dedicato
+	if (name === "lead_benvenuto" && j.error) {
+		const motivo = j.error.message || 'Errore generico';
+		const n = leadInfo?.name || "-";
+		const t = leadInfo?.phone || "-";
+		const e = leadInfo?.email || "-";
+		await sendTemplate(env, env.OWNER_PHONE, 'notifica_lead_fallito', [
+			{ type: 'text', text: n },
+			{ type: 'text', text: t },
+			{ type: 'text', text: e },
+			{ type: 'text', text: motivo }
+		]);
+		console.log('🚨 Template notifica_lead_fallito inviato a OWNER');
+	}
+
 	return j?.messages?.[0]?.id ?? null;
 }
 
