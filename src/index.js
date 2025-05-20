@@ -1,13 +1,10 @@
 /**********************************************************************
  * Cloudflare Worker – Lead capture + WhatsApp relay bidirezionale
- * versione DELAY + NOTIFICA TEMPLATE 2025-06-17
+ * versione DELAY + FOLLOWUP AUTO 2025-06-18
  **********************************************************************/
 
 export default {
 
-	/* =================================================================
-	 * HTTP entry-point: webhook
-	 * ===============================================================*/
 	async fetch(request, env) {
 		const { method, url } = request;
 		const u = new URL(url);
@@ -51,7 +48,7 @@ export default {
 
 				// -- messaggi / status ----------------------------------
 				const msg = change.value?.messages?.[0];
-				const status = change.value?.statuses?.[0];        // non gestito ora
+				const status = change.value?.statuses?.[0];
 				if (msg) await handleMessage(msg, env);
 				else if (status) console.log('📶 EVENT status:', status);
 				else console.log('ℹ️ Evento ignorato');
@@ -65,26 +62,72 @@ export default {
 	},
 
 	/* =================================================================
-	 * CRON: ogni 5 min invia i lead scaduti
+	 * CRON: ogni 5 min invia i lead scaduti e gestisce follow-up
 	 * ===============================================================*/
 	async scheduled(event, env, ctx) {
 		const now = Date.now();
+		const tzOffset = 3; // UTC+3
+		const hourToSend = parseInt(env.FOLLOWUP_HOUR || '19', 10);
+
+		const ms1 = 1000 * 60 * 60 * (parseFloat(env.FOLLOWUP1_HOURS) || 24); // default 24h
+		const ms2 = 1000 * 60 * 60 * 24 * (parseFloat(env.FOLLOWUP2_DAYS) || 15); // default 15d
+		const maxAge = 1000 * 60 * 60 * 24 * (parseFloat(env.CLEANUP_DAYS) || 20); // default 20d
+
 		const list = await env.KV.list({ prefix: 'pending_lead:' });
-		console.log('⏰ Cron: pending =', list.keys.length);
+		console.log(`⏰ Scheduled follow-up: ${list.keys.length} pending`);
 
 		for (const k of list.keys) {
 			const data = JSON.parse(await env.KV.get(k.name));
-			if (!data) continue;
+			if (!data || !data.phone) continue;
 
-			if (now - data.created >= data.delay) {
-				console.log(`🚀 INVIO ritardato a ${data.phone} (${data.name})`);
-				const leadInfo = {
-					name: data.name,
-					phone: data.phone,
-					email: data.email || ""
-				};
-				await sendTemplate(env, data.phone, env.TEMPLATE_LEAD, [], leadInfo);
+			const phone = data.phone;
+			const name = data.name || "";
+			const email = data.email || "";
+			const created = data.created || 0;
+
+			const hourNow = new Date(now + tzOffset * 3600 * 1000).getUTCHours();
+
+			// STOP se lead ha risposto almeno una volta
+			if (await env.KV.get(`lead:${phone}`)) {
 				await env.KV.delete(k.name);
+				await env.KV.delete(`lead_followup:${phone}`);
+				continue;
+			}
+
+			// 1) Primo invio ritardato 30-90min (lead_benvenuto)
+			if (now - created >= data.delay && !data.sentFirst) {
+				console.log(`🚀 INVIO ritardato a ${phone} (${name})`);
+				const leadInfo = { name, phone, email };
+				const ok = await sendTemplate(env, phone, env.TEMPLATE_LEAD, [], leadInfo);
+				data.sentFirst = true;
+				await env.KV.put(k.name, JSON.stringify(data), { expirationTtl: 2_592_000 });
+			}
+
+			// 2) Follow-up 1 (solo se mai risposto, mai mandato followup1, e all'orario giusto)
+			let state = {};
+			try { state = JSON.parse(await env.KV.get(`lead_followup:${phone}`)) || {}; } catch { }
+			const sent1 = !!state.sent1, sent2 = !!state.sent2;
+
+			// Soglia per il primo follow-up: dopo ms1 (default 24h) e solo all'ora giusta
+			if (!sent1 && now - created > ms1 && hourNow === hourToSend) {
+				await sendTemplate(env, phone, env.TEMPLATE_FOLLOWUP1, [{ type: "text", text: name }]);
+				state.sent1 = true;
+				await env.KV.put(`lead_followup:${phone}`, JSON.stringify(state), { expirationTtl: 2_592_000 });
+				console.log(`🚩 Primo follow-up inviato a ${phone} (${name})`);
+			}
+			// Soglia per il secondo follow-up: dopo ms2 (default 15d) e solo all'ora giusta
+			if (!sent2 && now - created > ms2 && hourNow === hourToSend) {
+				await sendTemplate(env, phone, env.TEMPLATE_FOLLOWUP2, [{ type: "text", text: name }]);
+				state.sent2 = true;
+				await env.KV.put(`lead_followup:${phone}`, JSON.stringify(state), { expirationTtl: 2_592_000 });
+				console.log(`🚩 Secondo follow-up inviato a ${phone} (${name})`);
+			}
+
+			// 3) Cleanup dei lead vecchi (dopo maxAge)
+			if (now - created > maxAge) {
+				await env.KV.delete(k.name);
+				await env.KV.delete(`lead_followup:${phone}`);
+				console.log(`🗑️ Cleanup lead vecchio ${phone}`);
 			}
 		}
 	}
@@ -117,12 +160,13 @@ async function handleLeadDelayed(leadId, env) {
 
 	if (!phone) { console.warn('⚠️ Lead senza telefono'); return; }
 
-	/*-- delay 30-90 min --*/
+	// delay 30-90 min (in ms)
 	const delayMs = 30 * 60 * 1000 + Math.floor(Math.random() * 60 * 60 * 1000);
 	await env.KV.put(`pending_lead:${phone}`, JSON.stringify({
 		phone, name, email,
 		created: Date.now(),
-		delay: delayMs
+		delay: delayMs,
+		sentFirst: false
 	}), { expirationTtl: 2_592_000 });
 
 	// Salva anche nome e email per lookup (notifiche future)
@@ -193,7 +237,8 @@ async function sendTemplate(env, to, name, parameters, leadInfo = null) {
 	const url = `https://graph.facebook.com/v22.0/${env.WHATSAPP_PHONE_ID}/messages`;
 
 	let components = [];
-	if (name === 'lead_benvenuto' && env.MEDIA_ID_LEAD) {
+	// Aggiungi header SOLO se sia MEDIA_ID_LEAD che il template lo richiede
+	if (name === 'lead_benvenuto' && env.MEDIA_ID_LEAD && env.TEMPLATE_LEAD_HAS_HEADER === '1') {
 		components.push({
 			type: 'header',
 			parameters: [{ type: 'image', image: { id: env.MEDIA_ID_LEAD } }]
@@ -202,15 +247,19 @@ async function sendTemplate(env, to, name, parameters, leadInfo = null) {
 	if (parameters.length)
 		components.push({ type: 'body', parameters });
 
+	const template = {
+		name,
+		language: { code: 'it' }
+	};
+	if (components.length > 0) {
+		template.components = components;
+	}
+
 	const body = {
 		messaging_product: 'whatsapp',
 		to,
 		type: 'template',
-		template: {
-			name,
-			language: { code: 'it' },
-			...(components.length && { components })
-		}
+		template
 	};
 
 	console.log('➡️ POST template', name, '→', to);

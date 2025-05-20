@@ -31,7 +31,14 @@
 		"TEMPLATE_LEAD": "lead_benvenuto",
 		"TEMPLATE_NOTIFY": "lead_forward",
 		"TEMPLATE_FOLLOWUP_24H": "follow_up_24h",
-		"MEDIA_ID_LEAD": "667403296061435"
+		"TEMPLATE_FOLLOWUP1": "follow_up_2gg",
+		"TEMPLATE_FOLLOWUP2": "follow_up_15gg",
+		"MEDIA_ID_LEAD": "667403296061435",
+		"FOLLOWUP1_HOURS": "24", // ore per 1° follow-up (default 24)
+		"FOLLOWUP2_DAYS": "15", // giorni per 2° follow-up (default 15)
+		"FOLLOWUP_HOUR": "19", // ora UTC+3 per follow-up (default 19)
+		"CLEANUP_DAYS": "20", // giorni dopo cui pulire i lead vecchi
+		"TEMPLATE_LEAD_HAS_HEADER": "0" // 0=No, 1=Yes No images or other headers actually
 	}
 }
 /**
