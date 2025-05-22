@@ -38,7 +38,10 @@
 		"FOLLOWUP2_DAYS": "15", // giorni per 2° follow-up (default 15)
 		"FOLLOWUP_HOUR": "19", // ora UTC+3 per follow-up (default 19)
 		"CLEANUP_DAYS": "20", // giorni dopo cui pulire i lead vecchi
-		"TEMPLATE_LEAD_HAS_HEADER": "0" // 0=No, 1=Yes No images or other headers actually
+		"TEMPLATE_LEAD_HAS_HEADER": "0", // 0=No, 1=Yes No images or other headers actually
+		"RESEND_FROM_EMAIL": "paolo@gmvassago.it",
+		"RESEND_FROM_NAME": "GM Vassago",
+		"LOGO_URL": "https://i.imgur.com/cyDrFMF.png"
 	}
 }
 /**

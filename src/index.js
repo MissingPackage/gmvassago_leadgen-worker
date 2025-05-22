@@ -88,7 +88,7 @@ export default {
 			const hourNow = new Date(now + tzOffset * 3600 * 1000).getUTCHours();
 
 			// STOP se lead ha risposto almeno una volta
-			if (await env.KV.get(`lead:${phone}`)) {
+			if (data.sentFirst && await env.KV.get(`lead:${phone}`)) {
 				await env.KV.delete(k.name);
 				await env.KV.delete(`lead_followup:${phone}`);
 				continue;
@@ -138,10 +138,10 @@ export default {
  * =================================================================*/
 async function handleLeadDelayed(leadId, env) {
 	const url = `https://graph.facebook.com/v22.0/${leadId}?access_token=${env.FB_TOKEN}`;
-	console.log('⬇️ FETCH lead:', url);
+	console.log(`⬇️ FETCH lead`);
 
 	const lead = await fetch(url).then(r => r.json());
-	console.log('📑 Lead JSON:', JSON.stringify(lead, null, 2));
+	console.log(`📑 Lead JSON: ${JSON.stringify(lead, null, 2)}`);
 
 	const rawPhone =
 		lead?.field_data?.find(x => x.name === 'numero_di_telefono')?.values?.[0] ??
@@ -158,9 +158,24 @@ async function handleLeadDelayed(leadId, env) {
 	// LOG FORMATTATO
 	console.log(`👤 Lead estratto: Nome = "${name || '-'}" | Telefono = "${phone || '-'}" | Email = "${email || '-'}"`);
 
+	// 1. INVIO EMAIL SUBITO se presente
+	if (email) {
+		const EMAIL_WELCOME_TEMPLATE = getEmailWelcomeTemplate(env);
+
+		// Invia email tramite Resend
+		await sendEmailResend(
+			env,
+			email,
+			EMAIL_WELCOME_TEMPLATE.subject,
+			EMAIL_WELCOME_TEMPLATE.html,
+			EMAIL_WELCOME_TEMPLATE.text
+		);
+		console.log(`📧 Invio email Resend: ${JSON.stringify(emailRes)}`);
+	}
+
+	// 2. WhatsApp: metti in pending con delay
 	if (!phone) { console.warn('⚠️ Lead senza telefono'); return; }
 
-	// delay 30-90 min (in ms)
 	const delayMs = 30 * 60 * 1000 + Math.floor(Math.random() * 60 * 60 * 1000);
 	await env.KV.put(`pending_lead:${phone}`, JSON.stringify({
 		phone, name, email,
@@ -169,7 +184,6 @@ async function handleLeadDelayed(leadId, env) {
 		sentFirst: false
 	}), { expirationTtl: 2_592_000 });
 
-	// Salva anche nome e email per lookup (notifiche future)
 	await env.KV.put(`name:${phone}`, name, { expirationTtl: 2_592_000 });
 	await env.KV.put(`email:${phone}`, email, { expirationTtl: 2_592_000 });
 
@@ -226,7 +240,7 @@ async function handleMessage(msg, env) {
 	}
 	await env.KV.put(`lead:${userPhone}`, Date.now().toString(), { expirationTtl: 2_592_000 });
 
-	console.log(`⬅️ Relay Paolo→utente ${userPhone}:`, msg.text.body);
+	console.log(`⬅️ Relay Paolo→utente ${userPhone}: ${msg.text.body}`);
 	await sendText(env, userPhone, msg.text.body);
 }
 
@@ -308,8 +322,122 @@ async function sendText(env, to, text) {
 		},
 		body: JSON.stringify(body)
 	}).then(r => r.json());
-	console.log('📬 text resp:', JSON.stringify(j));
+	console.log(`📬 text resp: ${JSON.stringify(j)}`);
 }
+
+/* ===================================================================
+ * 4. SEND EMAIL (Resend)
+ * =================================================================*/
+
+async function sendEmailResend(env, to, subject, html, text = '') {
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), 8000); // 8s soft timeout
+
+	try {
+		const res = await fetch('https://api.resend.com/emails', {
+			method: 'POST',
+			headers: {
+				'Authorization': `Bearer ${env.RESEND_API_KEY}`,
+				'Content-Type': 'application/json'
+			},
+			body: JSON.stringify({
+				from: `${env.RESEND_FROM_NAME || 'GM Vassago'} <${env.RESEND_FROM_EMAIL}>`,
+				to: Array.isArray(to) ? to : [to], subject, html, ...(text ? { text } : {})
+			}),
+			signal: controller.signal
+		});
+		clearTimeout(timeout);
+		console.log(`📧 Invio mail a: ${to} | subject: ${subject}`);
+		const result = await res.json();
+		console.log(`📧 Email Resend: ${JSON.stringify(result)}`);
+		return result;
+	} catch (err) {
+		console.error(`❌ Errore invio mail: ${err}`);
+		return null;
+	}
+}
+
+function getEmailWelcomeTemplate(env) {
+	const fromEmail = env.RESEND_FROM_EMAIL;
+	const whatsapp = env.OWNER_PHONE ? `https://wa.me/${env.OWNER_PHONE.replace(/\D/g, '')}` : '';
+	const site = 'https://gmvassago.it';
+
+	return {
+		subject: "Benvenuto in GM Vassago – La tua avventura inizia ora",
+		html: `
+      <div style="font-family: Arial, Helvetica, sans-serif; color: #222; max-width: 540px;">
+        <h2 style="color: #1f1f1f;">Benvenuto in GM Vassago</h2>
+        <p>
+          Gentile avventuriero,<br><br>
+          ti ringraziamo per averci contattato.<br>
+          <br>
+          Se desideri partecipare alle nostre <b>sessioni di Dungeons & Dragons</b> o vuoi migliorare le tue capacità narrative con la <b>GM Vassago Academy</b>, sei nel posto giusto.<br>
+          <br>
+          Siamo a tua disposizione per qualsiasi domanda o approfondimento: puoi rispondere direttamente a questa email</a>.
+        </p>
+        <p>
+          <b>Contattaci subito anche su WhatsApp: </b>
+          <a href="${whatsapp}" style="color: #25D366; font-weight: bold;">Scrivi su WhatsApp a GM Vassago!</a>
+        </p>
+        <p>
+          <b>Perché scegliere GM Vassago?</b><br>
+          • Esperienza professionale e personalizzata<br>
+          • Materiale ufficiale e supporto dedicato<br>
+          • Community esclusiva per giocatori e Game Master<br>
+        </p>
+        <p>
+          <b>Vuoi fissare una chiamata o una prima sessione conoscitiva?</b><br>
+          Rispondi direttamente a questa email o manda un messaggio WhatsApp, ti ricontatteremo al più presto.<br>
+        </p>
+        <br>
+        <p style="font-size: 1.05em; font-weight: bold; color: #222; margin-bottom: 0; margin-top: 32px;">
+          GM Vassago: Deluxe Gaming for Deluxe Players
+        </p>
+        <img src="${env.LOGO_URL}" alt="GMV Logo" style="display:block; margin: 24px auto 8px auto; max-width:220px; border-radius:10px;">
+        <hr style="margin: 16px 0 12px 0;">
+        <p style="font-size: 0.96em; color: #666; margin: 0;">
+          I servizi di GM Vassago sono riservati ai maggiorenni.<br>
+          <a href="${site}" style="color: #1769aa;">gmvassago.it</a>
+        </p>
+        <p style="font-size: 0.90em; color: #888; margin-top: 16px;">
+          Questa email è stata inviata automaticamente in seguito a una richiesta di contatto.<br>
+          Se pensi di aver ricevuto questo messaggio per errore, puoi ignorarlo in tutta sicurezza.
+        </p>
+      </div>
+    `,
+		text: `
+Benvenuto in GM Vassago
+
+Gentile avventuriero,
+
+ti ringraziamo per averci contattato.
+
+Se desideri partecipare alle nostre sessioni di Dungeons & Dragons o vuoi migliorare le tue capacità narrative con la GM Vassago Academy, sei nel posto giusto.
+
+Siamo a tua disposizione per qualsiasi domanda o approfondimento.
+Puoi rispondere a questa email (${fromEmail}) oppure contattarci su WhatsApp: ${whatsapp}
+
+Perché scegliere GM Vassago?
+• Esperienza professionale e personalizzata
+• Materiale ufficiale e supporto dedicato
+• Community esclusiva per giocatori e Game Master
+
+Vuoi fissare una chiamata o una prima sessione conoscitiva?
+Rispondi direttamente a questa email o manda un messaggio WhatsApp, ti ricontatteremo al più presto.
+
+GM Vassago: Deluxe Gaming for Deluxe Players
+
+---
+
+I servizi di GM Vassago sono riservati ai maggiorenni.
+${site}
+
+Questa email è stata inviata automaticamente in seguito a una richiesta di contatto.
+Se pensi di aver ricevuto questo messaggio per errore, puoi ignorarlo in tutta sicurezza.
+`
+	};
+}
+
 
 /* ===================================================================
  * 4. PHONE helper

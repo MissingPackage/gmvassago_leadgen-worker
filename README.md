@@ -1,54 +1,55 @@
-# Lead-to-WhatsApp Automation
+# **Lead-to-WhatsApp Automation**
 
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-orange?logo=cloudflare)](https://workers.dev)
 [![WhatsApp Cloud API](https://img.shields.io/badge/WhatsApp-Cloud%20API-25D366?logo=whatsapp&logoColor=green)](https://developers.facebook.com/docs/whatsapp/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Made with ❤️](https://img.shields.io/badge/Made%20with-%E2%9D%A4-red)](https://gmvassago.it)
 
-> **Zero-cost, zero-maintenance** pipeline that greets every new Facebook/Instagram Lead-Ads contact with a personalised WhatsApp message—powered by Cloudflare Workers and Meta APIs.
+> **Zero-cost, zero-maintenance** pipeline that welcomes every new Facebook/Instagram Lead Ads contact with a personalized WhatsApp message and a welcome email—powered by Cloudflare Workers and Meta APIs.
 
 ---
 
-## ✨ Features
+## **✨ Features**
 
-|                            |                                                                            |
-| -------------------------- | -------------------------------------------------------------------------- |
-| **Always-Free Hosting**    | Cloudflare Workers free tier (100k req/day) with automatic TLS 1.3         |
-| **Instant Lead Capture**   | Webhook on `leadgen` delivers the lead **from any present or future form** |
-| **Personalised WhatsApp**  | Sends a template message (`lead_benvenuto`) using WhatsApp Cloud API       |
-| **Follow-up Automations**  | Automatic, rule-based follow-up after 24h and 15 days, time-window aware   |
-| **Resilient Notification** | If WhatsApp fails, instant notification to admin with reason & fallback    |
-| **GDPR-ready**             | No permanent user data, all info is auto-expiring and periodically cleaned |
-| **No Dev-Ops**             | `wrangler deploy` — that’s it. No servers, no cron cert renewals           |
+| Feature                       | Description                                                             |
+| ----------------------------- | ----------------------------------------------------------------------- |
+| **Free Hosting**              | Cloudflare Workers (100k req/day) with free TLS 1.3                     |
+| **Instant Lead Capture**      | Webhook captures leads from any active or future Lead Ads form          |
+| **WhatsApp Template Message** | Sends `lead_benvenuto` via WhatsApp Cloud API with dynamic parameters   |
+| **Welcome Email**             | Instantly sends branded email via Resend when email is available        |
+| **Follow-up Automation**      | Automatic follow-up after 24h and 15 days if no user reply is detected  |
+| **Error Notification**        | Owner receives WhatsApp alert if message delivery fails                 |
+| **Privacy-Friendly**          | All user data is stored temporarily and auto-purged for GDPR compliance |
+| **Zero DevOps**               | Just `wrangler deploy` — no server to maintain, no certs, no cron setup |
 
 ---
 
-## 📐 Logical Flow
+## **📐 Logical Flow**
 
 ```mermaid
 flowchart TD
-    A[Facebook / Instagram Lead Ads] --> B(Webhook su Cloudflare Worker)
-    B --> C{hub.verify_token OK?}
-    C -- NO --> Z1[Ignora richiesta]
-    C -- Sì --> D[Fetch full lead da Meta API]
-    D --> E[Estrai nome / telefono]
-    E --> F[Salva lead in pending KV Store con delay 30-90 min]
-    F --> G[waitUntil ritardo simulato]
-    G --> H[Invia template WhatsApp lead_benvenuto]
-    H --> I{Invio riuscito?}
-    I -- NO --> J[Notifica OWNER via WhatsApp notifica_lead_fallito]
-    I -- Sì --> K[Attendi risposta utente]
-    K --> L{Risposta utente?}
-    L -- Sì --> M[Notifica OWNER, cancella follow-up]
-    L -- NO --> N[Follow-up automatici: 24h e 15gg]
-    N --> O{Risposta dopo follow-up?}
-    O -- Sì --> M
-    O -- NO --> P[Cleanup lead da KV]
+    A[Facebook / Instagram Lead Ads] --> B[Cloudflare Webhook Trigger]
+    B --> C{hub.verify_token valid?}
+    C -- NO --> Z1[Reject request]
+    C -- YES --> D[Fetch full lead from Meta Graph API]
+    D --> E[Extract name / phone / email]
+    E --> F[Store in KV as pending_lead with random delay 30–90 min]
+    F --> G[Send Welcome Email if email present]
+    G --> H[After delay, send WhatsApp template lead_benvenuto]
+    H --> I{Message sent successfully?}
+    I -- NO --> J[Notify OWNER via WhatsApp template notifica_lead_fallito]
+    I -- YES --> K[Wait for user reply]
+    K --> L{User replies via WhatsApp?}
+    L -- YES --> M[Notify OWNER and stop follow-up]
+    L -- NO --> N[Auto follow-ups: 24h + 15d at specific hour]
+    N --> O{User replies after follow-up?}
+    O -- YES --> M
+    O -- NO --> P[Clean up expired lead from KV store]
 ```
 
 ---
 
-## 🛠️ Project Structure
+## **🛠️ Project Structure**
 
 ```
 leadgen-worker/
@@ -60,12 +61,12 @@ leadgen-worker/
 
 ---
 
-## 🚀 Quick Start
+## **🚀 Quick Start**
 
 ### 1. Clone & Install
 
 ```bash
-git clone https://github.com/your-org/leadgen-worker.git
+git clone https://github.com/MissingPackage/leadgen-worker.git
 cd leadgen-worker
 npm install -g wrangler   # if not installed
 ```
@@ -95,7 +96,9 @@ wrangler secret put TEMPLATE_FOLLOWUP1 # followup_24h
 wrangler secret put TEMPLATE_FOLLOWUP2 # followup_15d
 wrangler secret put TEMPLATE_FAIL # notifica_lead_fallito
 wrangler secret put OWNER_PHONE # +3934xxxxxx
-
+wrangler secret put RESEND_API_KEY
+wrangler secret put RESEND_FROM_EMAIL
+wrangler secret put RESEND_FROM_NAME
 # Opzionali
 
 wrangler secret put MEDIA_ID_LEAD # (image for welcome template) 4. Deploy
@@ -106,93 +109,69 @@ wrangler tail # watch logs. Create a test lead in the Lead Ads Testing Tool – 
 
 ---
 
-## 🧩 Functional & Error-Proof Flow (IT/EN)
+## **🧩 Functional Overview**
 
-### **Flusso funzionale**
+### 1. Lead Capture & Email
 
-1. **Arrivo Lead**
+- New lead triggers the Worker via webhook.
 
-   - Il worker riceve una chiamata webhook da Meta con un nuovo lead (`leadgen_id`).
+- Lead data is fetched from Meta Graph API.
 
-   - Estrae nome, telefono (normalizzato, aggiungendo +39 se serve), email.
+- Email (if present) is used to send a personalized welcome email via Resend.
 
-   - Salva il lead in "pending" (su KV) con delay random (tra 30 e 90 min) per evitare lo spam e simulare un contatto umano.
+- Phone number is normalized and saved in KV with a 30–90 minute delay.
 
-   - Il log mostra sempre nome, telefono, email per controllo immediato.
+### 2. WhatsApp Template Delivery
 
-   - Se il numero è mancante/non valido, il lead viene ignorato (con warning).
+- After delay, `lead_benvenuto` template is sent via WhatsApp Cloud API.
 
-2. **Primo invio WhatsApp**
+- If delivery fails (e.g. not a WhatsApp user), the OWNER receives a WhatsApp notification with error reason.
 
-   - Dopo il delay, il worker invia il template lead_benvenuto via WhatsApp.
+### 3. Reply & Relay Logic
 
-   - Se l’invio fallisce (es. numero non WhatsApp), Paolo (OWNER) riceve immediata notifica via template WhatsApp (`notifica_lead_fallito`) con nome, telefono, email e motivazione tecnica.
+- If the user replies:
 
-   - Il log indica successo o errore.
+- The OWNER is notified with name, number, and message content.
 
-3. **Gestione Risposta**
+- All follow-ups are cancelled.
 
-   - Se il lead risponde via WhatsApp in qualunque momento:
+- The reply timestamp is saved to respect the 24h window constraint.
 
-   - Paolo riceve notifica immediata con nome, numero, email, testo breve.
+### 4. Follow-up Automation
 
-   - I follow-up futuri vengono cancellati e non sarà più automatizzato nessun messaggio.
+- If no reply is received:
 
-   - Tutto è tracciato via timestamp in KV, così si mantiene la compliance sulla finestra di 24h di WhatsApp.
+- 24h after first contact (at configured hour, default 19:00 UTC+3), followup_24h is sent.
 
-4. **Follow-up automatici**
+- 15 days later, `followup_15d` is sent.
 
-   - Se il lead non risponde mai:
+- After that, the lead is automatically deleted from the system.
 
-   - Primo follow-up alle 19:00 (UTC+3, configurabile via ENV) il giorno dopo il primo contatto.
+### 5. Repeat Lead Submissions
 
-   - Secondo follow-up 15 giorni dopo, sempre alle 19:00.
+- Even if a user previously interacted (has a lead: timestamp), a new lead triggers a new WhatsApp welcome message and email.
 
-   - Se dopo i due follow-up non c’è risposta, il lead viene pulito dal sistema.
+## Only the follow-up logic respects the lead:{phone} timestamp to decide whether to proceed.
 
-   - Nessun follow-up se la persona ha risposto almeno una volta.
+## **✅ Use Case Summary**
 
-5. **Risposta da Paolo (OWNER)**
+| Scenario                        | Outcome                                                               |
+| ------------------------------- | --------------------------------------------------------------------- |
+| New lead (valid number/email)   | WhatsApp + Email sent (delayed), follow-ups scheduled                 |
+| Number already responded before | Still gets welcome template & email; follow-ups blocked only if reply |
+| Lead replies after template     | OWNER notified, follow-ups cancelled                                  |
+| Lead never replies              | Gets follow-ups at 24h and 15d, then deleted                          |
+| Invalid or non-WhatsApp number  | OWNER notified via `notifica_lead_fallito`                            |
 
-   - Paolo può rispondere solo "in reply" al messaggio notificato.
+## **⚙️ Configuration Notes**
 
-   - Il messaggio viene inoltrato all’utente come testo, se la finestra WhatsApp è aperta.
+- All timings, message templates, expiration TTLs, and follow-up logic are fully environment-configurable.
 
-   - Se la finestra 24h è chiusa, viene inviato prima un template di re-engagement, poi il testo.
+- Supports media header (image) in WhatsApp template messages.
 
-6. **Pulizia e monitoraggio**
+- Extendable with custom channels (email, Telegram, CRM integrations).
 
-   - Tutti i dati (lead, messaggi, follow-up) sono auto-expiring dopo un periodo configurabile (default 20gg).
-
-   - Il KV viene periodicamente ripulito per garantire compliance e zero accumulo inutile.
-
-   - I log di Cloudflare Worker offrono sempre nome, telefono, email e status di ogni azione.
-
----
-
-## **Summary — All possible scenarios**
-
-- ✅ **Numero WhatsApp valido**: riceve template, eventuali follow-up, se risponde blocca le automazioni.
-
-- ❌ **Numero errato/non WhatsApp**: Paolo riceve notifica con error reason.
-
-- ⏳ **Lead che non risponde mai**: riceve follow-up a 24h (19:00 UTC+3) e 15gg; poi cleanup.
-
-- 💬 **Lead che risponde**: Paolo riceve notifica, follow-up cancellati.
-
-- 🧹 **Nessun dato personale permanente**: tutti i dati (nome, telefono, email, interazioni) vengono cancellati dopo massimo 20 giorni.
-
----
-
-## **Configurazione avanzata / Ambiente**
-
-- Delay, orario follow-up, giorni cleanup, template names… tutti parametri sono configurabili via variabili d’ambiente (`wrangler secret put`).
-
-- Supporto template WhatsApp con media header (immagine di benvenuto).
-
-- Puoi aggiungere rapidamente altri canali di notifica (es. email, Telegram) modificando il worker.
-
-## 🔄 **Token Refresh (optional)**
+## 🔄 **Token Rotation (optional)**
 
 - System-User token is permanent.
 
@@ -203,10 +182,10 @@ wrangler tail # watch logs. Create a test lead in the Lead Ads Testing Tool – 
 crons = ["0 0 1 */2 *"] # every 60 days and call the token-extend endpoint, updating FB_TOKEN in KV or as a new secret.
 ```
 
-## 📝 License
+## **📝 License**
 
 **MIT © 2025 GMVassago Team / Cristiano Mazzella Solution Architect**
 
 ---
 
-Documentazione aggiornata a giugno 2025.
+**_Last Updated June 2025._**
