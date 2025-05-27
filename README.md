@@ -49,6 +49,33 @@ flowchart TD
 
 ---
 
+## **✅ Lead Management Flow**
+
+```mermaid
+flowchart TD
+    A[Facebook / Instagram Lead Ads] --> B[Cloudflare Webhook Trigger]
+    B --> D[Fetch full lead from Meta Graph API]
+    D --> E[Extract name / phone / email]
+    E --> G[Send Welcome Email immediately]
+    E --> F[Store in KV as pending_lead with 30–90 min delay]
+
+    subgraph "Follow-up process"
+    F --> H[After delay, send WhatsApp template lead_benvenuto]
+    H --> K[Wait for user reply]
+    K -- No reply after 24h --> L[Send Follow-up 1 at 19:00]
+    L -- No reply after 15 days --> N[Send Follow-up 2 at 19:00]
+    N -- No reply after 20 days --> P[Clean up lead from KV store]
+
+    K -- Reply --> M[Notify OWNER and stop follow-up]
+    L -- Reply --> M
+    N -- Reply --> M
+    end
+
+    H -- Failed --> J[Notify OWNER via notifica_lead_fallito]
+```
+
+---
+
 ## **🛠️ Project Structure**
 
 ```

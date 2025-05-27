@@ -1,7 +1,30 @@
 /**********************************************************************
  * Cloudflare Worker – Lead capture + WhatsApp relay bidirezionale
  * versione DELAY + FOLLOWUP AUTO 2025-06-18
+ * 
+ * KEYS UTILIZZATE:
+ * pending_lead:{phone} - Lead in attesa di invio/followup (se sentFirst: false)
+ * lead:{phone} - Lead che hanno ricevuto risposta almeno una volta
+ * lead_followup:{phone} - Stato follow-up per un lead
+ * name:{phone} - Nome associato al numero
+ * email:{phone} - Email associata al numero
+ * relay:{messageId} - Mapping tra msg_id di notifica e numero utente
+ * seen:{messageId} - Deduplica messaggi già processati
+ * lead_counter - Contatore totale lead ricevuti (valore numerico)
  **********************************************************************/
+
+// Numeri di telefono per test istantaneo WhatsApp (aggiungi qui i tuoi numeri di test)
+const TEST_PHONES = [
+	//'+393383231742', // esempio: sostituisci con i tuoi numeri
+	'+393773925575',
+	'+393939439138',
+	'+358458588800',
+	'+393318343142',
+	// '+393471234567',
+];
+
+import { handleLeadAction, handleLeadsDashboard } from './leads-dashboard.js';
+import { analyzeWhatsAppError, formatErrorMessage, getRetryStrategy } from './whatsapp-utils.js';
 
 export default {
 
@@ -23,6 +46,73 @@ export default {
 			}
 			console.warn('❌ Handshake FAILED');
 			return new Response('Forbidden', { status: 403 });
+		}
+
+		// --- DASHBOARD stats (solo con autenticazione) --------------
+		if (method === 'GET' && u.pathname === '/stats') {
+
+			// Raccogli tutte le statistiche
+			try {
+				const totalLeads = parseInt(await env.KV.get("lead_counter") || "0");
+				const pendingList = await env.KV.list({ prefix: 'pending_lead:' });
+				const leadList = await env.KV.list({ prefix: 'lead:' });
+
+				// Per ogni lead pending, recuperiamo lo stato
+				const pendingLeads = [];
+				for (const k of pendingList.keys) {
+					const dataRaw = await env.KV.get(k.name);
+					if (!dataRaw) continue;
+					try {
+						const data = JSON.parse(dataRaw);
+						const phone = data.phone;
+
+						// Ottieni stato follow-up
+						let followupState = {};
+						try {
+							const followupRaw = await env.KV.get(`lead_followup:${phone}`);
+							if (followupRaw) followupState = JSON.parse(followupRaw);
+						} catch { }
+
+						// Mostra anche errori e retry info
+						pendingLeads.push({
+							phone: data.phone,
+							name: data.name || "",
+							email: data.email || "",
+							created: data.created || 0,
+							age: Math.round((Date.now() - data.created) / (1000 * 60 * 60 * 24)),
+							sentFirst: data.sentFirst || false,
+							sent1: followupState.sent1 || false,
+							sent2: followupState.sent2 || false,
+							retryCount: data.retryCount || 0,
+							nextRetry: data.nextRetry || null,
+							erroreFinale: data.erroreFinale || null
+						});
+					} catch { }
+				}
+
+				// Raccogli statistiche
+				const stats = {
+					totalLeads,
+					pendingCount: pendingList.keys.length,
+					respondedCount: leadList.keys.length,
+					pendingLeads: pendingLeads,
+					generatedAt: new Date().toISOString()
+				};
+
+				return new Response(JSON.stringify(stats, null, 2), {
+					status: 200,
+					headers: {
+						'Content-Type': 'application/json'
+					}
+				});
+			} catch (err) {
+				return new Response(JSON.stringify({ error: err.message || 'Errore nel recupero statistiche' }), {
+					status: 500,
+					headers: {
+						'Content-Type': 'application/json'
+					}
+				});
+			}
 		}
 
 		// --- 2) POST webhook ----------------------------------------
@@ -50,11 +140,119 @@ export default {
 				const msg = change.value?.messages?.[0];
 				const status = change.value?.statuses?.[0];
 				if (msg) await handleMessage(msg, env);
-				else if (status) console.log('📶 EVENT status:', status);
+				else if (status) {
+					console.log('📶 EVENT status:', status);
+					// Notifica OWNER se status fallito per messaggio benvenuto
+					if (status.status === 'failed' || status.status === 'undelivered') {
+						// Recupera il lead associato a questo messaggio (cerca tra pending_lead)
+						const list = await env.KV.list({ prefix: 'pending_lead:' });
+						for (const k of list.keys) {
+							const dataRaw = await env.KV.get(k.name);
+							if (!dataRaw) continue;
+							let data;
+							try { data = JSON.parse(dataRaw); } catch { continue; }
+							if (data.benvenutoMsgId && data.benvenutoMsgId === status.id) {
+								// Analizza errore WhatsApp
+								const errorAnalysis = analyzeWhatsAppError(status);
+								// Calcola strategia retry
+								const retryInfo = getRetryStrategy(errorAnalysis, data);
+								// Formatta messaggio errore per OWNER
+								const motivo = formatErrorMessage(errorAnalysis, retryInfo);
+								const n = data.name || '-';
+								const t = data.phone || '-';
+								const e = data.email || '-';
+								await sendTemplate(env, env.OWNER_PHONE, 'notifica_lead_fallito', [
+									{ type: 'text', text: n },
+									{ type: 'text', text: t },
+									{ type: 'text', text: e },
+									{ type: 'text', text: motivo }
+								]);
+								console.log('🚨 Notifica fallimento WhatsApp inviata a OWNER per', t, '|', motivo);
+								// Aggiorna retryCount e nextRetry se necessario
+								if (retryInfo.shouldRetry) {
+									data.retryCount = retryInfo.retryCount;
+									data.nextRetry = retryInfo.nextRetry;
+									await env.KV.put(k.name, JSON.stringify(data), { expirationTtl: 2_592_000 });
+									console.log('🔁 Retry WhatsApp schedulato per', t, 'tra', Math.round(retryInfo.delay / 3600000), 'ore');
+								} else {
+									// Errore permanente: marca errore e rimuovi dal pending dopo notifica
+									data.erroreFinale = errorAnalysis.desc;
+									await env.KV.put(k.name, JSON.stringify(data), { expirationTtl: 2_592_000 });
+									// (opzionale) elimina subito dal pending
+									// await env.KV.delete(k.name);
+									console.log('🛑 Lead', t, 'marcato come errore permanente:', errorAnalysis.desc);
+								}
+								break;
+							}
+						}
+					}
+				}
 				else console.log('ℹ️ Evento ignorato');
 			} catch (err) { console.error('❌ POST handler error:', err); }
 
 			return ok();
+		}
+
+		// --- MASS WELCOME + CLEANUP endpoint (autenticato) -----------
+		if (method === 'POST' && u.pathname === '/mass-welcome-cleanup') {
+			const pendingList = await env.KV.list({ prefix: 'pending_lead:' });
+			const followupList = await env.KV.list({ prefix: 'lead_followup:' });
+			let sent = 0, alreadySent = 0, errors = 0;
+			let results = [];
+			for (const k of pendingList.keys) {
+				const dataRaw = await env.KV.get(k.name);
+				if (!dataRaw) continue;
+				let data;
+				try { data = JSON.parse(dataRaw); } catch { errors++; continue; }
+				const phone = data.phone;
+				if (!phone) { errors++; continue; }
+				let status = 'already_sent';
+				let msgId = null;
+				if (!data.sentFirst) {
+					const leadInfo = { name: data.name || '', phone, email: data.email || '' };
+					try {
+						msgId = await sendTemplate(env, phone, env.TEMPLATE_LEAD, [], leadInfo);
+						status = msgId ? 'sent' : 'send_error';
+						sent++;
+					} catch {
+						status = 'send_error';
+						errors++;
+					}
+				} else {
+					alreadySent++;
+				}
+				results.push({ phone, name: data.name || '', email: data.email || '', status, msgId });
+			}
+			// Cleanup tutte le chiavi pending_lead e lead_followup
+			for (const k of pendingList.keys) { await env.KV.delete(k.name); }
+			for (const k of followupList.keys) { await env.KV.delete(k.name); }
+			return new Response(JSON.stringify({
+				total: pendingList.keys.length,
+				sent,
+				alreadySent,
+				errors,
+				results,
+				cleaned: pendingList.keys.length + followupList.keys.length
+			}, null, 2), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
+
+		// --- LEAD DASHBOARD HTML (delegato) ---------------------------
+		if (method === 'GET' && u.pathname === '/leads-dashboard') {
+			return await handleLeadsDashboard(request, env);
+		}
+		// --- LEAD ACTION API (delegato) -------------------------------
+		if (method === 'POST' && u.pathname === '/lead-action') {
+			return await handleLeadAction(request, env, sendTemplate);
+		}
+
+		// --- LEADS DASHBOARD LOGIN (delegato) ---------------------------
+		if (
+			(u.pathname === '/leads-dashboard/login' && (method === 'GET' || method === 'POST'))
+		) {
+			return await handleLeadsDashboard(request, env);
 		}
 
 		return new Response('Not found', { status: 404 });
@@ -68,68 +266,151 @@ export default {
 		const now = Date.now();
 		const tzOffset = 3; // UTC+3
 		const hourToSend = parseInt(env.FOLLOWUP_HOUR || '19', 10);
+		const currentHour = new Date(now + tzOffset * 3600 * 1000).getUTCHours();
 
 		const ms1 = 1000 * 60 * 60 * (parseFloat(env.FOLLOWUP1_HOURS) || 24); // default 24h
 		const ms2 = 1000 * 60 * 60 * 24 * (parseFloat(env.FOLLOWUP2_DAYS) || 15); // default 15d
 		const maxAge = 1000 * 60 * 60 * 24 * (parseFloat(env.CLEANUP_DAYS) || 20); // default 20d
 
+		console.log(`📊 Configurazione follow-up:
+		🕒 FOLLOWUP1_HOURS: ${parseFloat(env.FOLLOWUP1_HOURS) || 24}h (${Math.round(ms1 / 3600000)}h)
+		🕒 FOLLOWUP2_DAYS: ${parseFloat(env.FOLLOWUP2_DAYS) || 15}d (${Math.round(ms2 / 86400000)}d)
+		🕒 CLEANUP_DAYS: ${parseFloat(env.CLEANUP_DAYS) || 20}d
+		🕒 ORA CORRENTE (UTC+${tzOffset}): ${currentHour}:00
+		🕒 ORA FOLLOWUP: ${hourToSend}:00`);
+
+		const totalLeads = parseInt(await env.KV.get("lead_counter") || "0");
 		const list = await env.KV.list({ prefix: 'pending_lead:' });
-		console.log(`⏰ Scheduled follow-up: ${list.keys.length} pending`);
+		console.log(`⏰ Scheduled follow-up: ${list.keys.length} pending / ${totalLeads} totali`);
+		console.log('⏰ Scheduled follow-up: pending_lead:', list.keys.map(k => k.name));
+
+		let countProcessed = 0;
+		let countSkipped = 0;
+		let countSentWelcome = 0;
+		let countSentFollowup1 = 0;
+		let countSentFollowup2 = 0;
+		let countCleaned = 0;
+		let countErrors = 0;
 
 		for (const k of list.keys) {
-			const data = JSON.parse(await env.KV.get(k.name));
-			if (!data || !data.phone) continue;
+			countProcessed++;
+			const dataRaw = await env.KV.get(k.name);
+			if (!dataRaw) {
+				console.warn(`⚠️ Nessun dato per ${k.name}`);
+				countErrors++;
+				continue;
+			}
+
+			let data;
+			try {
+				data = JSON.parse(dataRaw);
+			} catch (err) {
+				console.error(`❌ Errore parsing JSON per ${k.name}:`, err);
+				countErrors++;
+				continue;
+			}
+
+			if (!data.phone) {
+				console.warn(`⚠️ Lead senza telefono per ${k.name}`);
+				countErrors++;
+				continue;
+			}
 
 			const phone = data.phone;
 			const name = data.name || "";
 			const email = data.email || "";
 			const created = data.created || 0;
+			const leadAge = Math.round((now - created) / (1000 * 60 * 60 * 24));
 
-			const hourNow = new Date(now + tzOffset * 3600 * 1000).getUTCHours();
+			console.log(`🔍 PROCESSING ${k.name}: età=${leadAge}d, nome="${name}", sentFirst=${!!data.sentFirst}`);
 
 			// STOP se lead ha risposto almeno una volta
-			if (data.sentFirst && await env.KV.get(`lead:${phone}`)) {
+			const leadKey = await env.KV.get(`lead:${phone}`);
+			if (leadKey) {
+				console.log(`🛑 Lead ${phone} già risposto, cancello pending e followup`);
 				await env.KV.delete(k.name);
 				await env.KV.delete(`lead_followup:${phone}`);
+				countSkipped++;
 				continue;
 			}
 
-			// 1) Primo invio ritardato 30-90min (lead_benvenuto)
-			if (now - created >= data.delay && !data.sentFirst) {
-				console.log(`🚀 INVIO ritardato a ${phone} (${name})`);
-				const leadInfo = { name, phone, email };
-				const ok = await sendTemplate(env, phone, env.TEMPLATE_LEAD, [], leadInfo);
-				data.sentFirst = true;
-				await env.KV.put(k.name, JSON.stringify(data), { expirationTtl: 2_592_000 });
+			// Cleanup lead con errore permanente più vecchi di 3 giorni
+			if (data.erroreFinale && now - created > 3 * 24 * 60 * 60 * 1000) {
+				console.log(`🗑️ Cleanup lead errore permanente ${phone} (${leadAge} giorni, errore: ${data.erroreFinale})`);
+				await env.KV.delete(k.name);
+				await env.KV.delete(`lead_followup:${phone}`);
+				countCleaned++;
+				continue;
 			}
 
-			// 2) Follow-up 1 (solo se mai risposto, mai mandato followup1, e all'orario giusto)
+			// 1) Primo invio (benvenuto) se non ancora inviato
+			if (!data.sentFirst) {
+				console.log(`🚀 INVIO benvenuto a ${phone} (${name})`);
+				const leadInfo = { name, phone, email };
+				const msgId = await sendTemplate(env, phone, env.TEMPLATE_LEAD, [], leadInfo);
+				console.log(`📬 Risposta sendTemplate (benvenuto) per ${phone}:`, msgId);
+				data.sentFirst = true;
+				data.benvenutoMsgId = msgId;
+				data.sentFirstAt = Date.now();
+				await env.KV.put(k.name, JSON.stringify(data), { expirationTtl: 2_592_000 });
+				countSentWelcome++;
+			}
+
+			// 2) Follow-up 1 e 2 (solo se mai risposto e all'orario giusto)
 			let state = {};
 			try { state = JSON.parse(await env.KV.get(`lead_followup:${phone}`)) || {}; } catch { }
 			const sent1 = !!state.sent1, sent2 = !!state.sent2;
+			console.log(`📈 Follow-up status per ${phone}: sent1=${sent1}, sent2=${sent2}, hourNow=${currentHour}, followupHour=${hourToSend}`);
 
-			// Soglia per il primo follow-up: dopo ms1 (default 24h) e solo all'ora giusta
-			if (!sent1 && now - created > ms1 && hourNow === hourToSend) {
-				await sendTemplate(env, phone, env.TEMPLATE_FOLLOWUP1, [{ type: "text", text: name }]);
-				state.sent1 = true;
-				await env.KV.put(`lead_followup:${phone}`, JSON.stringify(state), { expirationTtl: 2_592_000 });
-				console.log(`🚩 Primo follow-up inviato a ${phone} (${name})`);
+			// Follow-up 1 (24h dopo, all'ora specificata)
+			if (data.sentFirst && !sent1 && now - created > ms1) {
+				if (currentHour === hourToSend) {
+					const resp = await sendTemplate(env, phone, env.TEMPLATE_FOLLOWUP1, []); // <-- nessun parametro
+					console.log(`📬 Risposta sendTemplate (followup1) per ${phone}:`, resp);
+					state.sent1 = true;
+					state.sent1At = Date.now();
+					await env.KV.put(`lead_followup:${phone}`, JSON.stringify(state), { expirationTtl: 2_592_000 });
+					console.log(`🚩 Primo follow-up inviato a ${phone} (${name})`);
+					countSentFollowup1++;
+				} else {
+					console.log(`⏰ Follow-up 1 pronto per ${phone} ma attende ora corretta (${currentHour} vs ${hourToSend})`);
+					countSkipped++;
+				}
 			}
-			// Soglia per il secondo follow-up: dopo ms2 (default 15d) e solo all'ora giusta
-			if (!sent2 && now - created > ms2 && hourNow === hourToSend) {
-				await sendTemplate(env, phone, env.TEMPLATE_FOLLOWUP2, [{ type: "text", text: name }]);
-				state.sent2 = true;
-				await env.KV.put(`lead_followup:${phone}`, JSON.stringify(state), { expirationTtl: 2_592_000 });
-				console.log(`🚩 Secondo follow-up inviato a ${phone} (${name})`);
+
+			// Follow-up 2 (15gg dopo, all'ora specificata)
+			if (data.sentFirst && !sent2 && now - created > ms2) {
+				if (currentHour === hourToSend) {
+					const resp = await sendTemplate(env, phone, env.TEMPLATE_FOLLOWUP2, []); // <-- nessun parametro
+					console.log(`📬 Risposta sendTemplate (followup2) per ${phone}:`, resp);
+					state.sent2 = true;
+					state.sent2At = Date.now();
+					await env.KV.put(`lead_followup:${phone}`, JSON.stringify(state), { expirationTtl: 2_592_000 });
+					console.log(`🚩 Secondo follow-up inviato a ${phone} (${name})`);
+					countSentFollowup2++;
+				} else {
+					console.log(`⏰ Follow-up 2 pronto per ${phone} ma attende ora corretta (${currentHour} vs ${hourToSend})`);
+					countSkipped++;
+				}
 			}
 
 			// 3) Cleanup dei lead vecchi (dopo maxAge)
 			if (now - created > maxAge) {
+				console.log(`🗑️ Cleanup lead vecchio ${phone} (${leadAge} giorni)`);
 				await env.KV.delete(k.name);
 				await env.KV.delete(`lead_followup:${phone}`);
-				console.log(`🗑️ Cleanup lead vecchio ${phone}`);
+				countCleaned++;
 			}
 		}
+
+		console.log(`📊 RIEPILOGO SCHEDULED:
+- Lead processati: ${countProcessed}/${list.keys.length}
+- Welcome inviati: ${countSentWelcome}
+- Follow-up 1 inviati: ${countSentFollowup1}
+- Follow-up 2 inviati: ${countSentFollowup2}
+- Lead ripuliti: ${countCleaned}
+- Lead skippati: ${countSkipped}
+- Errori: ${countErrors}`);
 	}
 };
 
@@ -137,10 +418,25 @@ export default {
  * 1. SALVA LEAD in pending con delay random
  * =================================================================*/
 async function handleLeadDelayed(leadId, env) {
+	// Incrementa contatore totale lead
+	let totalLeadCount = parseInt(await env.KV.get("lead_counter") || "0");
+	totalLeadCount++;
+	await env.KV.put("lead_counter", totalLeadCount.toString());
+	console.log(`📊 Lead totali ricevuti: ${totalLeadCount}`);
+
 	const url = `https://graph.facebook.com/v22.0/${leadId}?access_token=${env.FB_TOKEN}`;
 	console.log(`⬇️ FETCH lead`);
 
-	const lead = await fetch(url).then(r => r.json());
+	const lead = await fetch(url).then(r => r.json()).catch(err => {
+		console.error(`❌ Errore fetch lead da Facebook: ${err.message || err}`);
+		return null;
+	});
+
+	if (!lead || lead.error) {
+		console.error(`❌ Lead non valido o errore API Facebook: ${JSON.stringify(lead?.error || 'Nessuna risposta')}`);
+		return;
+	}
+
 	console.log(`📑 Lead JSON: ${JSON.stringify(lead, null, 2)}`);
 
 	const rawPhone =
@@ -155,15 +451,18 @@ async function handleLeadDelayed(leadId, env) {
 
 	const phone = normalizePhone(rawPhone);
 
+	// Verifica della validità del numero WhatsApp
+	const isValidPhone = phone && phone.length >= 10 && phone.startsWith('+');
+
 	// LOG FORMATTATO
-	console.log(`👤 Lead estratto: Nome = "${name || '-'}" | Telefono = "${phone || '-'}" | Email = "${email || '-'}"`);
+	console.log(`👤 Lead estratto: Nome = "${name || '-'}" | Telefono = "${phone || '-'}" ${isValidPhone ? '✅' : '❌'} | Email = "${email || '-'}"`);
 
 	// 1. INVIO EMAIL SUBITO se presente
 	if (email) {
 		const EMAIL_WELCOME_TEMPLATE = getEmailWelcomeTemplate(env);
 
 		// Invia email tramite Resend
-		await sendEmailResend(
+		const emailRes = await sendEmailResend(
 			env,
 			email,
 			EMAIL_WELCOME_TEMPLATE.subject,
@@ -171,23 +470,54 @@ async function handleLeadDelayed(leadId, env) {
 			EMAIL_WELCOME_TEMPLATE.text
 		);
 		console.log(`📧 Invio email Resend: ${JSON.stringify(emailRes)}`);
+	} else {
+		console.log(`⚠️ Lead senza email, nessuna mail inviata`);
 	}
 
 	// 2. WhatsApp: metti in pending con delay
-	if (!phone) { console.warn('⚠️ Lead senza telefono'); return; }
+	if (!isValidPhone) {
+		console.warn(`⚠️ Lead senza telefono valido: "${rawPhone}" → "${phone}"`);
+		// Salva comunque nome e email se presenti
+		if (name) await env.KV.put(`lead_name:${totalLeadCount}`, name, { expirationTtl: 2_592_000 });
+		if (email) await env.KV.put(`lead_email:${totalLeadCount}`, email, { expirationTtl: 2_592_000 });
+		return;
+	}
 
-	const delayMs = 30 * 60 * 1000 + Math.floor(Math.random() * 60 * 60 * 1000);
+	// Controlla se già esiste un pending con questo numero
+	const existingLeadRaw = await env.KV.get(`pending_lead:${phone}`);
+	if (existingLeadRaw) {
+		const existingLead = JSON.parse(existingLeadRaw);
+		if (existingLead.erroreFinale) {
+			console.log(`⛔ Lead ${phone} già marcato errore permanente: ${existingLead.erroreFinale}`);
+			return;
+		}
+		console.log(`⚠️ Lead duplicato! Telefono ${phone} già presente in pending_lead`);
+	}
+
+	// ELIMINA IL DELAY: invio immediato per tutti
+	let delayMs = 0;
+	let sentFirst = false;
+	let benvenutoMsgId = null;
+	console.log(`🚀 Invio WhatsApp immediato a ${phone}`);
+	const leadInfo = { name, phone, email };
+	benvenutoMsgId = await sendTemplate(env, phone, env.TEMPLATE_LEAD, [], leadInfo);
+	sentFirst = true;
+	console.log(`📬 Messaggio benvenuto inviato subito: ${benvenutoMsgId}`);
+
+	// Salva il lead con tutte le info rilevanti
 	await env.KV.put(`pending_lead:${phone}`, JSON.stringify({
 		phone, name, email,
 		created: Date.now(),
 		delay: delayMs,
-		sentFirst: false
+		sentFirst,
+		benvenutoMsgId,
+		leadId // Aggiungiamo anche l'ID originale del lead
 	}), { expirationTtl: 2_592_000 });
 
 	await env.KV.put(`name:${phone}`, name, { expirationTtl: 2_592_000 });
 	await env.KV.put(`email:${phone}`, email, { expirationTtl: 2_592_000 });
 
-	console.log(`🕒 Lead in pending (${Math.round(delayMs / 60000)} min)`);
+	console.log(`🕒 Lead in pending (0 min) [INVIO IMMEDIATO]`);
 }
 
 /* ===================================================================
@@ -248,18 +578,34 @@ async function handleMessage(msg, env) {
  * 3. SEND TEMPLATE / TEXT
  * =================================================================*/
 async function sendTemplate(env, to, name, parameters, leadInfo = null) {
+	if (!to || !name) {
+		console.error(`❌ Errore invio template: parametri mancanti (to: ${to}, name: ${name})`);
+		return null;
+	}
+
+	// Sanitizza il numero di telefono
+	to = normalizePhone(to);
+	if (!to || to.length < 10) {
+		console.error(`❌ Numero di telefono non valido: ${to}`);
+		return null;
+	}
+
+	// Aggiunge un parametro vuoto se non ce ne sono per evitare problemi con alcuni template
+	parameters = parameters || [];
+
 	const url = `https://graph.facebook.com/v22.0/${env.WHATSAPP_PHONE_ID}/messages`;
 
 	let components = [];
 	// Aggiungi header SOLO se sia MEDIA_ID_LEAD che il template lo richiede
-	if (name === 'lead_benvenuto' && env.MEDIA_ID_LEAD && env.TEMPLATE_LEAD_HAS_HEADER === '1') {
+	if (name === env.TEMPLATE_LEAD && env.MEDIA_ID_LEAD && env.TEMPLATE_LEAD_HAS_HEADER === '1') {
 		components.push({
 			type: 'header',
 			parameters: [{ type: 'image', image: { id: env.MEDIA_ID_LEAD } }]
 		});
 	}
-	if (parameters.length)
+	if (parameters.length) {
 		components.push({ type: 'body', parameters });
+	}
 
 	const template = {
 		name,
@@ -276,33 +622,49 @@ async function sendTemplate(env, to, name, parameters, leadInfo = null) {
 		template
 	};
 
-	console.log('➡️ POST template', name, '→', to);
-	const j = await fetch(url, {
-		method: 'POST',
-		headers: {
-			Authorization: `Bearer ${env.WABA_TOKEN}`,
-			'Content-Type': 'application/json'
-		},
-		body: JSON.stringify(body)
-	}).then(r => r.json());
-	console.log('📬 template resp:', JSON.stringify(j));
+	console.log(`➡️ POST template "${name}" → ${to}`);
 
-	// Se errore invio lead, notifica Paolo (OWNER) tramite template dedicato
-	if (name === "lead_benvenuto" && j.error) {
-		const motivo = j.error.message || 'Errore generico';
-		const n = leadInfo?.name || "-";
-		const t = leadInfo?.phone || "-";
-		const e = leadInfo?.email || "-";
-		await sendTemplate(env, env.OWNER_PHONE, 'notifica_lead_fallito', [
-			{ type: 'text', text: n },
-			{ type: 'text', text: t },
-			{ type: 'text', text: e },
-			{ type: 'text', text: motivo }
-		]);
-		console.log('🚨 Template notifica_lead_fallito inviato a OWNER');
+	try {
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: {
+				Authorization: `Bearer ${env.WABA_TOKEN}`,
+				'Content-Type': 'application/json'
+			},
+			body: JSON.stringify(body)
+		});
+
+		if (!response.ok) {
+			console.error(`❌ Errore HTTP invio template: ${response.status} ${response.statusText}`);
+		}
+
+		const j = await response.json();
+		console.log(`📬 template resp:`, JSON.stringify(j));
+
+		// Se errore invio lead, notifica Paolo (OWNER) tramite template dedicato
+		if ((name === env.TEMPLATE_LEAD || name === "lead_benvenuto") && j.error) {
+			const motivo = j.error.message || j.error.code || 'Errore generico';
+			const n = leadInfo?.name || "-";
+			const t = leadInfo?.phone || "-";
+			const e = leadInfo?.email || "-";
+
+			// Previeni ricorsione infinita evitando di reinviare se siamo già in notifica
+			if (name !== 'notifica_lead_fallito') {
+				await sendTemplate(env, env.OWNER_PHONE, 'notifica_lead_fallito', [
+					{ type: 'text', text: n },
+					{ type: 'text', text: t },
+					{ type: 'text', text: e },
+					{ type: 'text', text: motivo }
+				]);
+				console.log(`🚨 Template notifica_lead_fallito inviato a OWNER per errore: ${motivo}`);
+			}
+		}
+
+		return j?.messages?.[0]?.id ?? null;
+	} catch (err) {
+		console.error(`❌ Errore invio template ${name}: ${err.message || err}`);
+		return null;
 	}
-
-	return j?.messages?.[0]?.id ?? null;
 }
 
 async function sendText(env, to, text) {
